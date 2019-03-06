@@ -1,0 +1,17 @@
+name: vstarcam
+version: 0.1.0
+
+authors:
+  - Ian Rash <redcodefinal@gmail.com>
+
+targets:
+  sandbox: 
+    main: src/sandbox.cr
+
+dependencies:
+  crest:
+    github: mamantoha/crest
+
+crystal: 0.27.0
+
+license: MIT
