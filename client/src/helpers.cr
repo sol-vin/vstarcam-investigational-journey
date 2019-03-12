@@ -14,6 +14,8 @@ module Helpers
   #   end
   # end
 
+  def self.bytes_to_string(uint)
+  end
 
 
   def self.u16_to_bytechars(uint) : String
