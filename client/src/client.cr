@@ -1,13 +1,13 @@
 require "logger"
 require "socket"
-require "./helpers"
 
 class Client
   STATES = [:nothing,
             :send_dbp, 
             :wait_for_dbr,
             :send_bcp, 
-            :handle_bp_handshake,
+            :wait_for_bps_and_echo,
+            :wait_for_bpa,
             :main_phase,
             :closing,
             :closed]
@@ -29,6 +29,9 @@ class Client
 
   # Broadcast socket for discovering new cameras on the network
   getter db_client_sock = UDPSocket.new
+  getter db_camera_sock = UDPSocket.new
+  getter db_client_sock = UDPSocket.new
+  getter bc_camera_sock = UDPSocket.new
 
   # Channel that will communicate data back to the tick fiber
   @data_channel = Channel(Tuple(String, Socket::IPAddress)).new
@@ -49,6 +52,17 @@ class Client
   
   # Destination address for the discovery packet
   DB_SOCK_CLIENT_DST = Socket::IPAddress.new("255.255.255.255", 8600)
+
+  # Listening address for DB requests to the camera.
+  DB_SOCK_CAMERA_SRC = Socket::IPAddress.new("0.0.0.0", 8600)
+
+  # Destination address for the DBR 
+  DB_SOCK_CAMERA_DST = Socket::IPAddress.new("255.255.255.255", 6801)
+
+  # Listening address for the f130 broadcast packet
+  BC_SOCK_CAMERA_SRC = Socket::IPAddress.new("0.0.0.0", 32108)
+
+  #BC_SOCK_CAMERA_DST IS UNKNOWN! We need to wait for a client to connect to us.
   
   # Special uuid which will unblock the data_fiber, allowing the program to exit.
   UNBLOCK_FIBER_DATA = "e127e855-36d2-43f1-82c0-95f2ba5fe800"
@@ -67,7 +81,7 @@ class Client
   DBR_GATEWAY = 0x24..0x33
   DBR_DNS1 = 0x34..0x43
   DBR_DNS2 = 0x44..0x53
-  DBR_MAC_ADDRESS = 0x54..0x59 # Stored as bytes
+  DBR_MAC_ADDRESS = 0x54..0x58 # Stored as bytes
   DBR_HTTP_PORT = 0x5a..0x5b   # Stored as Little Endian bytes
   DBR_BIG_I_HTTP_PORT = 0x5b
   DBR_LITTLE_I_HTTP_PORT = 0x5a
@@ -79,9 +93,9 @@ class Client
   DBR_DDNS_URL = 0x143..0x1c2
   DBR_SN = 0x1c3..0x1e2
   DBR_DDNS_PASSWORD = 0x1e3..0x1ff
-  #DBR_UNKNOWN2 = 0x204
-  #DBR_UNKNOWN2_DEFAULT = "\x02"
-  #DBR_PORT = 0x206..0x207  # Stored in big endian
+  DBR_UNKNOWN2 = 0x204
+  DBR_UNKNOWN2_DEFAULT = "\x02"
+  DBR_PORT = 0x206..0x207  # Stored in big endian
 
   # F130 broadcast packet data
   BCP = "\xf1\x30\x00\x00"
@@ -108,6 +122,10 @@ class Client
   PONG_PACKET = "\xf1\xe1\x00\x00"
   # Packet sent when the camera has timed out from ping-pong
   DISCONNECT_PACKET= "\xf1\xf0\x00\x00"
+
+  REPLY_HEADER = "\xf1\xd1\x00"
+  RESPONSE_HEADER = "\xf1\xd0\x00"
+
 
   # Are the client fibers currently running?
   getter? is_running = false
@@ -157,6 +175,16 @@ class Client
     # Our socket for sending discovery broadcasts.
     @db_client_sock.bind DB_SOCK_CLIENT_SRC
     @db_client_sock.setsockopt LibC::SO_BROADCAST, 1
+
+    # Our socket for recieving discovery broadcasts and sending DBRs
+    @db_camera_sock = UDPSocket.new
+    @db_camera_sock.bind DB_SOCK_CAMERA_SRC
+    @db_camera_sock.setsockopt LibC::SO_BROADCAST, 1
+
+    # Socket to get BCP
+    @bc_camera_sock = UDPSocket.new
+    @bc_camera_sock.bind BC_SOCK_CAMERA_SRC
+    @bc_camera_sock.setsockopt LibC::SO_BROADCAST, 1
   end
 
   def run
@@ -181,7 +209,7 @@ class Client
     change_state(:closing)
 
     # This line unblocks the @data_fiber
-    @data_sock.send(UNBLOCK_FIBER_DATA, Socket::IPAddress.new("127.0.0.1", DATA_SOCK_SRC.port))
+    unblock_data
     # Force a fiber change to go to the other fibers to end them
     Fiber.yield
 
@@ -197,6 +225,9 @@ class Client
     LOG.info("Closed client")
   end
 
+  def unblock_data
+    @data_sock.send(UNBLOCK_FIBER_DATA, Socket::IPAddress.new("127.0.0.1", DATA_SOCK_SRC.port))
+  end
 
   # Change the state of the client.
   def change_state(state)
@@ -213,7 +244,7 @@ class Client
         while is_running?
           # Will block execution
           packet = data_sock.receive
-          LOG.info "received packet from #{packet[1]}"
+          #LOG.info "received packet from #{packet[1]}"
           @data_channel.send(packet)
         end
       rescue e
@@ -242,22 +273,24 @@ class Client
       # Do nothing
     elsif state == :send_dbp
       send_dbp
-      change_state :wait_for_dbr
+      change_state(:wait_for_dbr)
     elsif state == :wait_for_dbr
       info = wait_for_dbr
       if info
         @target_info = info
-        change_state :send_bcp
+        change_state(:send_bcp)
       else
-        change_state :send_dbp
+        change_state(:send_dbp)
       end
     elsif state == :send_bcp
       send_bcp
-      change_state :handle_bp_handshake
-    elsif state == :handle_bp_handshake
-      handle_bp_handshake
+      change_state :wait_for_bps_and_echo
+    elsif state == :wait_for_bps_and_echo
+      wait_for_bps_and_echo
+      change_state(:wait_for_bpa)
 
-      if has_target?
+    elsif state == :wait_for_bpa
+      if wait_for_bpa
         change_state :main_phase
       else
         change_state :send_dbp
@@ -283,6 +316,7 @@ class Client
 
   # Wait for the DBR to come back from the camera.
   def wait_for_dbr : Hash(Symbol, String)?
+    # TODO: ADD TIMEOUTS!
     LOG.info("Waiting for DBR")
     packet = db_client_sock.receive
     if packet
@@ -332,50 +366,169 @@ class Client
     result
   end
 
+  # Makes a DBR given a dbr_hash
+  def self.make_dbr(dbr_hash) : String
+    dbr = DBR_HEADER
+    # Need to ljust for \x00 padding
+    dbr += dbr_hash[:camera_ip].ljust(DBR_CAMERA_IP.size,"\x00"[0])
+    dbr += dbr_hash[:netmask].ljust(DBR_NETMASK.size,"\x00"[0])
+    dbr += dbr_hash[:gateway].ljust(DBR_GATEWAY.size,"\x00"[0])
+    dbr += dbr_hash[:dns1].ljust(DBR_DNS1.size,"\x00"[0])
+    dbr += dbr_hash[:dns2].ljust(DBR_DNS2.size,"\x00"[0])
+    dbr += dbr_hash[:mac_address].split(':').map {|byte| String.new(Bytes[byte.to_i(16)])}.join
+    little_i = (dbr_hash[:http_port].to_i & 0x00ff)
+    big_i = (dbr_hash[:http_port].to_i & 0xff00) >> 8
+    #pp dbr_hash[:mac_address].split(':').map {|byte| String.new(Bytes[byte.to_i(16)])}.join.bytes.map {|b| "0x" + b.to_s 16}
+    dbr += String.new(Bytes[little_i, big_i])
+    dbr += dbr_hash[:uid].ljust(DBR_UID.size,"\x00"[0])
+    dbr += dbr_hash[:name].ljust(DBR_NAME.size,"\x00"[0])
+    dbr += dbr_hash[:ddns_ip].ljust(DBR_DDNS_IP.size,"\x00"[0])
+    dbr += "\x00" * 0x51
+    dbr += dbr_hash[:unknown1] # Single byte
+    dbr += "\x00" * 0x16
+    dbr += dbr_hash[:ddns_url].ljust(DBR_DDNS_URL.size,"\x00"[0])
+    dbr += dbr_hash[:sn].ljust(DBR_SN.size,"\x00"[0])
+    dbr += dbr_hash[:ddns_password].ljust(DBR_DDNS_PASSWORD.size,"\x00"[0])
+    dbr += "\x00"*3
+    dbr += DBR_UNKNOWN2_DEFAULT # Single byte
+    dbr += "\x00"
+    little_i = (DB_SOCK_CAMERA_DST.port & 0x00ff)
+    big_i = (DB_SOCK_CAMERA_DST.port  & 0xff00) >> 8
+    dbr += String.new(Bytes[big_i, little_i])
+    dbr += "\xff" * 4
+    dbr
+  end
+
+  def send_dbr(dbr_hash : Hash(Symbol, String))
+    dbr = Client.make_dbr(dbr_hash)
+    send_dbr dbr
+  end
+
+  def send_dbr(dbr_string : String)
+    @db_camera_sock.send(dbr_string, DB_SOCK_CAMERA_DST)
+  end
+
   # Send the magic f130 broadcast packet
   def send_bcp
     data_sock.send(BCP, BC_SOCK_CLIENT_DST)
   end
 
-  # Complete the handshake using BPS
-  def handle_bp_handshake
+  def wait_for_bps_and_echo
     LOG.info("Waiting for BPS")
-    packet = @data_channel.receive 
+    packet = receive_bps
     LOG.info("received a packet")
 
     if packet
-      
       data = packet[0]  # Contains the packet data
       camera_ip = packet[1] # Connection info to connect back into the camera (ip, port)
+      LOG.info("BPS Verified!")
+      data_sock.send(data, camera_ip)        
+      return true
+    end
+    return false
+  end
 
-      LOG.info("received a potential BPS from #{camera_ip}") 
-      # Check if out BPR is actually a BPR
-      if data[1] == BP_SYN
-        LOG.info("BPS Verified!")
-      else
-        LOG.info("BPS BAD! #{"\\x" + data.bytes.map {|d| d.to_s(16).rjust(2, '0')}.join("\\x")}")
-        return
-      end
+  def self.make_bps(uid)
+    bps = BPS_HEADER
+    bps += uid[0x0..0x3]
+    bps += "\x00" * 5
+    uid2 = uid[0x4..0x9].to_i
+    bps += String.new(Bytes[(uid2 & 0xff0000) >> 16, (uid2 & 0xff00) >> 8, uid2 & 0xff])
+    bps += uid[0xa..0xf]
+    bps += "\x00"*3
+    bps
+  end
 
-      # Echo back packet data back
-      LOG.info("Waiting for BPA")
-      data_sock.send(data, camera_ip)
-      # Recv the BPR ACK packet
-      packet = @data_channel.receive
-      if packet
-        LOG.info("received potential BPA?")
-        data = packet[0]
-        camera_ip = packet[1]
+  def self.parse_bps(uid)
+    #TODO: MAKE THIS WORK!
+  end
 
-        if data[1] == BP_ACK
-          LOG.info("BPA Verified! Handshake successful!")
-          # set the target camera to the current connection
-          new_target camera_ip
-        else
-          LOG.info("BPA BAD! #{data.bytes.map {|d| d.to_s(16).rjust(2, '0')}.join("\\x")}")
-        end
+  def send_bps(uid)
+    bps = Client.make_bps uid
+    @data_sock.send(bps, target)
+  end
+
+  def receive_bps
+    got_bps = false
+    until got_bps
+      potential_bps = @data_channel.receive
+      if potential_bps[0][0..3] == BPS_HEADER
+        got_bps = true
       end
     end
+    potential_bps
+  end
+
+  def receive_bps(timeout)
+    bps_channel = Channel(Bool).new
+
+    main_fiber = spawn do
+      got_bps = false
+      until got_bps
+        potential_bps = @data_channel.receive
+        if potential_bps[0][0..3] == BPS_HEADER
+          got_bps = true
+        elsif potential_bps[0] == UNBLOCK_FIBER_DATA
+          break
+        end
+      end
+      bps_channel.send got_bps
+    end
+
+    timeout_fiber = spawn do
+      sleep timeout
+      unblock_data
+    end
+
+    got_bps = bps_channel.receive
+    if got_bps
+      LOG.info "BPS SUCCESSFUL" 
+    else
+      LOG.info "BPS UNSUCCESSFUL"
+    end
+    got_bps
+  end
+
+  def wait_for_bpa
+    LOG.info("Waiting for BPA")
+    packet = receive_bpa
+    LOG.info("received a packet")
+
+    if packet
+      data = packet[0]  # Contains the packet data
+      camera_ip = packet[1] # Connection info to connect back into the camera (ip, port)
+      LOG.info("BPA Verified! Handshake Successful!")
+      new_target camera_ip    
+      return true
+    end
+    return false
+  end
+
+  def self.make_bpa(uid)
+    bpa = BPA_HEADER
+    bpa += uid[0x0..0x3]
+    bpa += "\x00" * 5
+    uid2 = uid[0x4..0x9].to_i
+    bpa += String.new(Bytes[(uid2 & 0xff0000) >> 16, (uid2 & 0xff00) >> 8, uid2 & 0xff])
+    bpa += uid[0xa..0xf]
+    bpa += "\x00"*3
+    bpa
+  end
+
+  def send_bpa(uid)
+    bpa = Client.make_bpa uid
+    @data_sock.send(bpa, target)
+  end
+
+  def receive_bpa
+    got_bpa = false
+    until got_bpa
+      potential_bpa = @data_channel.receive
+      if potential_bpa[0][0..3] == BPA_HEADER
+        got_bpa = true
+      end
+    end
+    potential_bpa
   end
 
   def main_phase
@@ -389,6 +542,13 @@ class Client
       send_ping
     elsif data[0] == DISCONNECT_PACKET
       LOG.info "RECEIVED DISCONNECT FROM CAMERA"
+      close
+    elsif data[0][0..2] == REPLY_HEADER
+      LOG.info "REPLY RECIEVED FROM CAMERA"
+    elsif data[0][0..2] == RESPONSE_HEADER
+      LOG.info "RESPONSE RECIEVED FROM CAMERA #{data[0].size}"   
+      LOG.info "\n" + data[0][0x10..data[0].size]
+      send_reply
     # This is important! The data fiber will block, waiting for data to come through
     # So to exit the program, we just send the unblock data to the data socket to free it
     elsif data[0][0..3] == BPA_HEADER
@@ -415,6 +575,58 @@ class Client
     LOG.info "Sent Disconnect"
   end
 
+  # Camera to client
+  #           Bytes in reply  Packet concerning
+  #                |               |
+  # "\xf1\xd1\x00\x08\xd1\x00\x00\x02\x00\x00\x00\x00"
+
+  # Client to camera
+  #           Bytes in reply  Packet concerning
+  #                |               |
+  # "\xf1\xd1\x00\x06\xd1\x00\x00\x01\x00\x00"
+
+  # Multipart ack reply
+  # "\xf1\xd1\x00\x18\xd1\x00\x00\x0a\x00\x0f\x00\x10\x00\x11\x00\x12"
+  # "\x00\x13\x00\x14\x00\x15\x00\x16\x00\x17\x00\x18"
+
+
+  @replies_sent = 0
+
+  def make_reply
+    reply = REPLY_HEADER
+    reply += "\x06" # REPLY BYTES
+    reply += "\xd1"
+    reply += "\x00"
+    reply += "\x00"
+    reply += "\x01"
+    reply += "\x00"
+    reply += String.new(Bytes[@replies_sent])
+    reply
+  end
+
+  def send_reply
+    reply = make_reply
+    @data_sock.send(reply, target)
+    @replies_sent += 1
+  end
+
+  # Single response header
+  # "\xf1\xd0\x00\x48\xd1\x00\x00\x00\x01\x0a\xa0\x60\x3c\x00\x00\x01" \
+
+
+  # This is an example header for when the camera sends a multipart response
+  # This example had data sizes of 1032, 1032, 1032, 728
+  # Multipacket header breakdown
+  #       Total size of packet   Total requests      Total Size of all packets                  
+  #              |      |             |                  |      |       
+  # 1 : "\xf1\xd0\x04\x04\xd1\x00\x00\x0b\x01\x0a\x02\x60\xc8\x0e\x00\x01" 
+  # 2 : "\xf1\xd0\x04\x04\xd1\x00\x00\x0c"
+  # 3 : "\xf1\xd0\x04\x04\xd1\x00\x00\x0d"
+  # 4 : "\xf1\xd0\x02\xd4\xd1\x00\x00\x0e"
+
+  def send_response(response)
+  end
+
   USER = "admin"
   PASS = "password"
   LOGIN_PARAMS = "&loginuse=#{USER}&loginpas=#{PASS}&user=#{USER}&pwd=#{PASS}"
@@ -432,6 +644,25 @@ class Client
   def send_udp_get_request(cgi : String, **params)
     param_string = params.keys.map{|param_name|"#{param_name}=#{params[param_name]}"}.join('&')
     get_request = "GET /#{cgi}.cgi?#{param_string}#{LOGIN_PARAMS}"
+    header = make_udp_header(get_request)
+    request_header = make_get_request_header(get_request)
+    data_sock.send(header + request_header + get_request, target)
+    @requests_sent += 1
+    LOG.info "SENT #{get_request}"
+  end
+
+  def send_udp_raw_get_request(request : String, **params)
+    param_string = params.keys.map{|param_name|"#{param_name}=#{params[param_name]}"}.join('&')
+    get_request = "GET /#{request}?#{param_string}"
+    header = make_udp_header(get_request)
+    request_header = make_get_request_header(get_request)
+    data_sock.send(header + request_header + get_request, target)
+    @requests_sent += 1
+    LOG.info "SENT #{get_request}"
+  end
+
+  def send_udp_raw_get_request(request : String)
+    get_request = "GET /#{request}"
     header = make_udp_header(get_request)
     request_header = make_get_request_header(get_request)
     data_sock.send(header + request_header + get_request, target)
