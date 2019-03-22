@@ -1,4 +1,4 @@
-module IfConfig
+module Ifconfig
   def self.get
     ifconfig_original = `ifconfig`
 

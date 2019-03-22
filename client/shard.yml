@@ -7,10 +7,14 @@ authors:
 targets:
   sandbox: 
     main: src/sandbox.cr
+  update_server: 
+    main: src/update_server.cr
+  exploit:
+    main: src/exploit.cr
 
 dependencies:
-  crest:
-    github: mamantoha/crest
+  kemal:
+    github: kemalcr/kemal
 
 crystal: 0.27.0
 
